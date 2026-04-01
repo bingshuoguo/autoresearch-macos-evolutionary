@@ -74,6 +74,22 @@ This layer is the immutable environment and fitness evaluator.
 
 The skeleton owns orchestration, not open-ended research logic.
 
+### Rendering Mechanism
+
+The initial implementation uses runtime config loading plus registry lookup, not code generation.
+
+- The evolution runner writes one `experiment.json` file per individual under `artifacts/<individual_id>/experiment.json`.
+- `train.py` accepts an explicit `--experiment <path>` argument. If omitted, it uses the baseline genome bundled with the repository.
+- The experiment file contains:
+  - `schema_version`
+  - genome content
+  - derived scalar values needed by the train skeleton
+  - selected slot IDs
+- `train.py` validates the experiment schema, resolves slot IDs through a Python registry, and instantiates the corresponding modules at runtime.
+- No templating or source-to-source code generation is used in the first version.
+
+This decision is on the critical path. It keeps the skeleton stable, makes artifacts inspectable, and avoids a separate code-generation layer.
+
 ### 3. Evolution Layer
 
 A new population management layer owns:
@@ -106,6 +122,25 @@ Each individual must have an explicit genome. The genome is the unit of heredity
 
 The genome is split into three gene families.
 
+### Schema Versioning and IDs
+
+Every genome record must include:
+
+- `schema_version`
+- `individual_id`
+- `generation`
+- `parents`
+
+The initial schema version is `1.0`.
+
+The initial ID rule is:
+
+- `individual_id = g{generation:04d}-i{ordinal:02d}-{genome_hash8}`
+- `genome_hash8` is the first 8 hex characters of the canonical JSON hash of the genome payload excluding run metadata
+- if a collision still occurs, append `-r{n:02d}`
+
+This keeps IDs readable, generation-local, and globally unique enough for the first implementation.
+
 ### Numeric Genes
 
 These are scalar or integer parameters such as:
@@ -131,8 +166,8 @@ These choose from a bounded set of legal values such as:
 
 - `window_pattern`
 - `head_dim`
-- `lr_schedule_type`
-- `init_scheme`
+- `kv_head_mode`
+- `logit_softcap`
 - `optimizer_grouping_strategy`
 
 These preserve comparability while still allowing structural variety.
@@ -152,9 +187,10 @@ Future slots can include optimizer policy variants, but the first version should
 
 ```json
 {
-  "id": "gen_0042_ind_03",
+  "schema_version": "1.0",
+  "individual_id": "g0042-i03-a1b2c3d4",
   "generation": 42,
-  "parents": ["gen_0041_ind_01", "gen_0041_ind_06"],
+  "parents": ["g0041-i01-b7c91a2e", "g0041-i06-9ad0c4bf"],
   "numeric": {
     "depth": 6,
     "aspect_ratio": 80,
@@ -214,6 +250,98 @@ These are deferred because they expand the failure surface disproportionately.
 
 This makes evolutionary reuse possible and lineage interpretable.
 
+### Slot Interface Contracts
+
+The first-wave slots must implement explicit Python interfaces.
+
+#### Attention Slot
+
+Factory signature:
+
+```python
+def build_attention(slot_config: dict, model_config: GPTConfig, layer_idx: int) -> nn.Module: ...
+```
+
+Returned module contract:
+
+```python
+def forward(
+    self,
+    x: torch.Tensor,
+    *,
+    ve: torch.Tensor | None,
+    cos_sin: tuple[torch.Tensor, torch.Tensor],
+    window_size: tuple[int, int],
+) -> torch.Tensor: ...
+```
+
+Invariants:
+
+- input `x` shape is `[B, T, C]`
+- output shape must also be `[B, T, C]`
+- no parameter allocation inside `forward`
+- module must preserve device placement
+- module may assume causal language-model semantics only
+
+#### MLP Slot
+
+Factory signature:
+
+```python
+def build_mlp(slot_config: dict, model_config: GPTConfig, layer_idx: int) -> nn.Module: ...
+```
+
+Returned module contract:
+
+```python
+def forward(self, x: torch.Tensor) -> torch.Tensor: ...
+```
+
+Invariants:
+
+- input and output shapes are both `[B, T, C]`
+- no parameter allocation inside `forward`
+- device and dtype must remain consistent with the surrounding block
+
+#### Schedule Slot
+
+Factory signature:
+
+```python
+def build_schedule(slot_config: dict, genome: dict) -> SchedulePolicy: ...
+```
+
+Returned object contract:
+
+```python
+class SchedulePolicy(Protocol):
+    def lr_multiplier(self, progress: float) -> float: ...
+    def muon_momentum(self, step: int) -> float: ...
+    def weight_decay(self, progress: float, base_weight_decay: float) -> float: ...
+```
+
+Invariants:
+
+- `progress` is always clamped to `[0.0, 1.0]`
+- returned values must be finite scalars
+- schedule policy must be pure with respect to run state
+
+#### Init Slot
+
+Factory signature:
+
+```python
+def apply_init(model: nn.Module, slot_config: dict, model_config: GPTConfig) -> None: ...
+```
+
+Invariants:
+
+- initialization happens in place
+- init logic cannot change model topology
+- init must leave every trainable parameter initialized exactly once
+
+These contracts are the blocking interface definitions needed before Phase 2 implementation begins.
+
 ## Evolution Loop
 
 The initial search strategy is a fixed-size generational GA with elitism.
@@ -231,6 +359,18 @@ The initial search strategy is a fixed-size generational GA with elitism.
 9. Rank the completed population.
 10. Advance to generation `g + 1`.
 
+### Execution Model
+
+The first implementation executes individuals sequentially on one accelerator.
+
+- one individual runs at a time
+- the default executor is single-process and single-device
+- generation wall-clock time is therefore approximately `population_size * 5 minutes` plus startup and evaluation overhead
+
+With the recommended initial defaults, this means roughly 30 to 40 minutes per generation.
+
+Parallel execution across multiple devices or mixed executors is explicitly deferred, but the runner should keep its executor boundary narrow enough that a future parallel backend can replace the sequential executor without rewriting genome or ranking logic.
+
 ### Selection
 
 The recommended initial policy is tournament selection with a small tournament size such as 3 or 4.
@@ -245,7 +385,7 @@ Rationale:
 
 Recommended crossover rules:
 
-- numeric genes: uniform crossover or arithmetic interpolation
+- numeric genes: per-gene random alpha blend with `alpha ~ Uniform(0.25, 0.75)`
 - categorical genes: parent-wise inheritance
 - slot genes: parent-wise inheritance by slot
 
@@ -259,7 +399,7 @@ Recommended mutation rules:
 - categorical genes: discrete jump within allowed values
 - slot genes: swap to another valid implementation ID
 
-Mutation rate should stay low enough that offspring are still traceable to parents.
+The initial mutation rate is `0.15` at the individual level. Each mutated individual should change only a small number of genes so offspring remain traceable to parents.
 
 ### Elitism
 
@@ -287,18 +427,29 @@ An individual is unstable if:
 - the run crashes
 - the summary output is incomplete
 - the training loop exceeds the allowed timeout
-- the loss explodes or becomes invalid
+- the raw training loss becomes `NaN` or `Inf`
+- the raw training loss exceeds `100` after the first 10 warmup steps
 
 Unstable individuals rank below any valid run regardless of nominal partial output.
 
 ### Complexity Score
 
-The initial complexity score should be a cheap heuristic, not a research project. It should combine signals such as:
+The initial complexity score is a deterministic weighted heuristic:
 
-- number of non-default slot selections
-- number of custom slot implementations introduced
-- parameter count increase relative to the baseline family
-- implementation novelty cost
+```text
+complexity_score =
+    1.0 * non_default_slot_count +
+    2.0 * custom_slot_count +
+    4.0 * max(0, (num_params / baseline_num_params) - 1.0)
+```
+
+Definitions:
+
+- `non_default_slot_count`: number of slot selections that differ from the baseline genome
+- `custom_slot_count`: number of selected slot IDs marked as agent-authored or experimental
+- `baseline_num_params`: parameter count of the repository baseline genome under the current skeleton release
+
+The score is rounded to 3 decimal places before ranking. Lower is better.
 
 This operationalizes the existing simplicity principle from the current project.
 
@@ -319,11 +470,21 @@ The current flat `results.tsv` is not enough for population search. The new syst
 - `library/slots/`
   - slot implementation registry and code
 
+### Retention Policy
+
+- `population/archive/*.json` generation snapshots are retained indefinitely in v1 because the metadata is small.
+- `artifacts/<individual_id>/experiment.json` is retained indefinitely for reproducibility.
+- large run logs may be pruned or compressed after summary extraction unless the individual is:
+  - an elite
+  - a generation winner
+  - a failed run needed for debugging a new experimental slot
+
 ### Run Record Fields
 
 Each run record should include at minimum:
 
 - `individual_id`
+- `schema_version`
 - `generation`
 - `parents`
 - `genome_hash`
@@ -341,6 +502,20 @@ This is the minimum information needed to analyze lineage and reproduce results.
 ## Agent Responsibilities
 
 The agent role changes materially in the new design.
+
+### Automation Boundary
+
+The automated evolution loop owns:
+
+- parent selection
+- crossover
+- mutation
+- experiment rendering
+- execution
+- ranking
+- archive persistence
+
+AI assistance is opt-in and out-of-band relative to the per-generation loop. In the initial version, the agent does not autonomously inject new active slot implementations during the same automated generation cycle.
 
 ### Breeder
 
@@ -370,6 +545,21 @@ The design must explicitly prevent evolutionary drift into an unusable codebase.
 - Slot implementations must pass interface validation before entering the active library.
 - Crash-heavy new slot variants should be quarantined after repeated failures.
 - Timeout and invalid-output handling must be first-class, not ad hoc.
+
+### Slot Validation Gate
+
+Agent-authored slot implementations do not enter the active library directly. They enter a staging area first.
+
+Promotion from staging to active requires all of:
+
+1. syntax and import validation
+2. registry signature validation against the slot contract
+3. successful construction test on the current runtime device
+4. a tiny forward or forward-backward smoke test for the slot type
+5. successful dry-run integration under the train skeleton for at least 1 to 2 optimizer steps
+6. explicit operator promotion in v1
+
+The automated evolution loop may only sample from the active slot library.
 
 ### Failure Classification
 
@@ -415,7 +605,12 @@ Implementation should happen in phases to limit risk.
 
 ### Phase 1
 
-Extract the current editable hyperparameters from `train.py` into an explicit genome/config object while preserving current behavior.
+Extract the current editable hyperparameters from `train.py` into an explicit genome/config object while preserving current behavior. This phase also introduces:
+
+- schema versioning
+- `individual_id` generation
+- `experiment.json` rendering
+- runtime registry lookup in `train.py`
 
 ### Phase 2
 
@@ -460,14 +655,16 @@ The first version should optimize for control and observability, not maximum nov
 
 The first implementation should assume:
 
-- fixed population size per generation
-- fixed elitism count
-- tournament selection
-- low mutation rate
-- one or two innovation slots per generation at most
+- `population_size = 6`
+- `elite_count = 2`
+- `tournament_size = 3`
+- `crossover_rate = 0.75`
+- `mutation_rate = 0.15`
+- `innovation_slots = 1`
+- sequential single-device execution
 - lexicographic ranking instead of Pareto fronts
 
-These defaults are intentionally conservative.
+The suggested operating range is population sizes from 4 to 8. `6` is the default because it preserves diversity while keeping generation time within roughly half an hour on the current 5-minute evaluation budget.
 
 ## Open Design Decisions Resolved Here
 
@@ -476,6 +673,7 @@ The following choices are considered decided for this design:
 - use a hybrid evolutionary system, not pure greedy search
 - use explicit genomes
 - use controlled evolvable slots instead of unrestricted full-file rewriting
+- use runtime JSON experiment rendering plus slot registry lookup
 - optimize lexicographically with `val_bpb` first
 - use fixed population size per generation
 - stage the implementation rather than replacing everything at once

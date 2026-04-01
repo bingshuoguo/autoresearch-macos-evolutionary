@@ -12,7 +12,7 @@ The target design is a hybrid approach:
 - Keep `prepare.py` frozen as the source of data loading and evaluation truth.
 - Refactor `train.py` into a stable training skeleton plus controlled evolvable slots.
 - Allow the agent to invent new slot implementations, but only within bounded extension points.
-- Rank individuals lexicographically: `val_bpb` first, then run stability, then memory, then complexity.
+- Filter invalid runs before ranking. Within the valid-run subset, rank lexicographically by `val_bpb`, then resource usage, then complexity.
 
 This preserves the original project philosophy of small, real, repeatable experiments while making search less myopic than hill climbing.
 
@@ -90,6 +90,31 @@ The initial implementation uses runtime config loading plus registry lookup, not
 
 This decision is on the critical path. It keeps the skeleton stable, makes artifacts inspectable, and avoids a separate code-generation layer.
 
+### Legacy Compatibility and Cutover
+
+The current repository contract is still the legacy greedy controller:
+
+- `program.md` instructs the agent to edit `train.py` directly and run one experiment at a time.
+- `README.md` describes `train.py` as the single agent-edited file.
+
+The evolutionary system therefore must ship with an explicit cutover path instead of silently replacing that contract.
+
+The cutover rule for v1 is:
+
+- Phase 1 and Phase 2 preserve legacy behavior for `uv run train.py` with no `--experiment` argument.
+- The new controller is introduced as a separate entrypoint, `uv run evolve.py`, during implementation.
+- `train.py` becomes the shared execution skeleton for both modes:
+  - legacy single-run mode when invoked without `--experiment`
+  - evolutionary mode when invoked by the population runner with `--experiment <path>`
+- `program.md` and `README.md` are not updated until the population runner is functional enough to execute at least one complete generation.
+- The cutover commit is atomic:
+  - add the population runner
+  - update `program.md`
+  - update `README.md`
+  - document legacy mode as compatibility mode rather than the primary workflow
+
+This prevents the implementation from entering a state where the codebase expects one controller but the user-facing agent contract still demands another.
+
 ### 3. Evolution Layer
 
 A new population management layer owns:
@@ -140,6 +165,41 @@ The initial ID rule is:
 - if a collision still occurs, append `-r{n:02d}`
 
 This keeps IDs readable, generation-local, and globally unique enough for the first implementation.
+
+### Genome Canonicalization and Validity
+
+The genome is not hashed or executed in raw form. It first passes through a normalization step that produces a canonical experiment config.
+
+Normalization rules for v1:
+
+- `window_pattern` is uppercased.
+- `window_pattern` must be non-empty and contain only `S` or `L`.
+- `base_dim = depth * aspect_ratio`.
+- `model_dim = ceil(base_dim / head_dim) * head_dim`.
+- `num_heads = model_dim / head_dim`.
+- `resolved_window_pattern` is the exact per-layer pattern after repeating or truncating `window_pattern` to `depth` layers, then forcing the final layer to `L` to match the current model behavior.
+- derived fields such as `model_dim`, `num_heads`, and `resolved_window_pattern` are not independent genes; they are canonical outputs of normalization.
+
+Validity checks before execution:
+
+- `depth >= 1`
+- `head_dim >= 1`
+- `device_batch_size >= 1`
+- `total_batch_size >= device_batch_size * MAX_SEQ_LEN`
+- `total_batch_size % (device_batch_size * MAX_SEQ_LEN) == 0`
+- every categorical value is in its allowed set
+- every slot ID resolves to a registered implementation
+
+If normalization fails or any validity check fails, the individual is marked invalid before training and receives no executable run artifact.
+
+The canonical JSON produced by normalization is the object used for:
+
+- `genome_hash8`
+- experiment rendering
+- deduplication
+- lineage comparison
+
+This prevents two raw genomes that normalize to the same executable phenotype from being treated as distinct individuals.
 
 ### Numeric Genes
 
@@ -342,6 +402,20 @@ Invariants:
 
 These contracts are the blocking interface definitions needed before Phase 2 implementation begins.
 
+### Slot Registry Identity
+
+Every active slot implementation must have registry metadata:
+
+- `slot_id`
+- `slot_type`
+- `implementation_version`
+- `source_file`
+- `source_sha256`
+
+The active slot registry also exposes a deterministic `slot_registry_hash` computed from the ordered manifest of all active entries.
+
+This registry identity is part of replayability. A run is not reproducible from genome data alone unless the skeleton and active registry are also pinned.
+
 ## Evolution Loop
 
 The initial search strategy is a fixed-size generational GA with elitism.
@@ -370,6 +444,14 @@ The first implementation executes individuals sequentially on one accelerator.
 With the recommended initial defaults, this means roughly 30 to 40 minutes per generation.
 
 Parallel execution across multiple devices or mixed executors is explicitly deferred, but the runner should keep its executor boundary narrow enough that a future parallel backend can replace the sequential executor without rewriting genome or ranking logic.
+
+Before a generation starts, the runner must record the code identity it is executing against:
+
+- `repo_commit`
+- `repo_tree_hash`
+- `slot_registry_hash`
+
+By default, v1 refuses to launch a generation on a dirty working tree. An explicit override may be added later, but dirty-tree execution is not part of the default reproducibility contract.
 
 ### Selection
 
@@ -411,26 +493,70 @@ This prevents population collapse from evaluation noise.
 
 The ranking scheme is lexicographic rather than full Pareto optimization.
 
-### Ranking Order
+### Validity Gate
+
+Ranking happens in two stages:
+
+1. Partition the population into valid and invalid individuals.
+2. Rank only within each partition.
+
+Every valid run outranks every invalid run, regardless of any placeholder metric values attached to invalid records.
+
+`val_bpb` for invalid runs must be stored as `null`, not `0.0`.
+
+This intentionally breaks compatibility with the legacy `results.tsv` convention where crashes were written as `0.000000`. That legacy convention is not safe for population ranking.
+
+### Ranking Order Within Valid Runs
 
 1. Lower `val_bpb`
-2. Successful, stable completion over crash or invalid run
-3. Lower peak memory usage
-4. Lower complexity score
+2. Lower resource usage when a comparable resource metric is available for both individuals
+3. Lower complexity score
 
-This matches the earlier design decision: `val_bpb` is primary, but not the only thing that matters.
+### Ranking Order Within Invalid Runs
+
+1. `invalid_output`
+2. `unstable`
+3. `timeout`
+4. `crash`
+
+This ordering is only for diagnostics and queue hygiene. Invalid runs never outrank valid ones.
+
+The invalid-run ordering must not be interpreted as model quality. It exists only to make crash triage deterministic.
 
 ### Stability Rules
 
-An individual is unstable if:
+An individual is unstable if execution began but the run lost numerical stability:
 
-- the run crashes
-- the summary output is incomplete
-- the training loop exceeds the allowed timeout
 - the raw training loss becomes `NaN` or `Inf`
 - the raw training loss exceeds `100` after the first 10 warmup steps
 
-Unstable individuals rank below any valid run regardless of nominal partial output.
+Invalid status rules:
+
+- `success`
+  - normalization passed
+  - training completed
+  - summary output was complete
+- `invalid_output`
+  - training completed or partially completed, but the summary payload was missing required fields
+- `unstable`
+  - training began, but loss failed the stability rules above
+- `timeout`
+  - wall-clock run exceeded the configured timeout
+- `crash`
+  - process exited abnormally before producing a valid summary
+
+Derived validity field:
+
+- `is_valid = (status == "success")`
+
+### Resource Tie-Break
+
+The initial resource metric is platform-aware:
+
+- on CUDA, use `peak_vram_mb`
+- on platforms where runtime peak memory is unavailable or known to be a constant placeholder, store `peak_vram_mb = null`
+
+If either compared valid individual has `peak_vram_mb = null`, skip the resource tie-break and compare complexity directly.
 
 ### Complexity Score
 
@@ -466,7 +592,7 @@ The current flat `results.tsv` is not enough for population search. The new syst
 - `results/runs.tsv`
   - one row per executed individual
 - `artifacts/<individual_id>/`
-  - rendered config, run log, summary output, optional derived metadata
+  - rendered config, run log, summary output, `registry_manifest.json`, optional derived metadata
 - `library/slots/`
   - slot implementation registry and code
 
@@ -488,7 +614,11 @@ Each run record should include at minimum:
 - `generation`
 - `parents`
 - `genome_hash`
+- `repo_commit`
+- `repo_tree_hash`
+- `slot_registry_hash`
 - `val_bpb`
+- `is_valid`
 - `status`
 - `training_seconds`
 - `total_seconds`
@@ -498,6 +628,12 @@ Each run record should include at minimum:
 - `description`
 
 This is the minimum information needed to analyze lineage and reproduce results.
+
+Field nullability rules:
+
+- `val_bpb` is `null` for every non-`success` status
+- `peak_vram_mb` is `null` when no trustworthy runtime peak memory metric is available on the current platform
+- `training_seconds` and `total_seconds` may be partial but never fabricated for failed runs
 
 ## Agent Responsibilities
 
@@ -609,6 +745,7 @@ Extract the current editable hyperparameters from `train.py` into an explicit ge
 
 - schema versioning
 - `individual_id` generation
+- normalization and validity checks
 - `experiment.json` rendering
 - runtime registry lookup in `train.py`
 
@@ -627,11 +764,20 @@ Keep the rest of the skeleton unchanged.
 Implement the population runner:
 
 - generation state
+- clean-worktree reproducibility check
 - selection
 - crossover
 - mutation
 - elitism
 - result recording
+
+### Phase 3.5
+
+Perform the controller cutover:
+
+- add `evolve.py` as the primary evolutionary entrypoint
+- update `program.md` from single-experiment greedy instructions to the new controller contract
+- update `README.md` so the primary workflow is evolutionary mode, while still documenting legacy single-run compatibility mode
 
 ### Phase 4
 
@@ -674,6 +820,7 @@ The following choices are considered decided for this design:
 - use explicit genomes
 - use controlled evolvable slots instead of unrestricted full-file rewriting
 - use runtime JSON experiment rendering plus slot registry lookup
+- gate ranking through `is_valid` before any metric tie-break
 - optimize lexicographically with `val_bpb` first
 - use fixed population size per generation
 - stage the implementation rather than replacing everything at once
@@ -683,8 +830,10 @@ The following choices are considered decided for this design:
 This design is successful if the implemented system can:
 
 - represent each candidate as a serializable genome
+- normalize genomes into a canonical executable form
 - generate a new population from prior populations without arbitrary manual edits
 - render genomes into repeatable experiments
+- record enough code identity to replay historical individuals
 - rank individuals consistently using the agreed ordering
 - preserve lineage and artifacts across generations
 - allow bounded agent-authored innovation without breaking the search loop

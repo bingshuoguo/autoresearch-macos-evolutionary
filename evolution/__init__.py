@@ -13,6 +13,20 @@ from .registry import (
     load_active_registry,
     slot_registry_hash,
 )
+from .ranking import (
+    INVALID_STATUS_ORDER,
+    VALID_STATUS,
+    compute_complexity_score,
+    rank_population,
+    validate_run_record,
+)
+from .artifacts import (
+    RUN_RECORD_FIELDS,
+    append_run_record,
+    ensure_artifact_dir,
+    write_experiment_artifact,
+    write_registry_manifest_artifact,
+)
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -24,4 +38,14 @@ __all__ = [
     "SlotManifestEntry",
     "load_active_registry",
     "slot_registry_hash",
+    "INVALID_STATUS_ORDER",
+    "VALID_STATUS",
+    "compute_complexity_score",
+    "rank_population",
+    "validate_run_record",
+    "RUN_RECORD_FIELDS",
+    "append_run_record",
+    "ensure_artifact_dir",
+    "write_experiment_artifact",
+    "write_registry_manifest_artifact",
 ]

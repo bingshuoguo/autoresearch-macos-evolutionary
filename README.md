@@ -4,7 +4,7 @@
 
 *One day, frontier AI research used to be done by meat computers in between eating, sleeping, having other fun, and synchronizing once in a while using sound wave interconnect in the ritual of "group meeting". That era is long gone. Research is now entirely the domain of autonomous swarms of AI agents running across compute cluster megastructures in the skies. The agents claim that we are now in the 10,205th generation of the code base, in any case no one could tell if that's right or wrong as the "code" is now a self-modifying binary that has grown beyond human comprehension. This repo is the story of how it all began. -@karpathy, March 2026*.
 
-The idea: give an AI agent a small but real LLM training setup and let it experiment autonomously overnight. It modifies the code, trains for 5 minutes, checks if the result improved, keeps or discards, and repeats. You wake up in the morning to a log of experiments and (hopefully) a better model. The training code here is a simplified single-GPU implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is that you're not touching any of the Python files like you normally would as a researcher. Instead, you are programming the `program.md` Markdown files that provide context to the AI agents and set up your autonomous research org. The default `program.md` in this repo is intentionally kept as a bare bones baseline, though it's obvious how one would iterate on it over time to find the "research org code" that achieves the fastest research progress, how you'd add more agents to the mix, etc. A bit more context on this project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
+The idea: give an AI agent a small but real LLM training setup and let it run an evolutionary search loop overnight. The controller renders candidate experiments, trains each one for 5 minutes, ranks valid and invalid runs, archives the artifacts, and breeds the next generation. You wake up in the morning to a lineage of experiments and, hopefully, a better model family. The training code here is a simplified single-device implementation of [nanochat](https://github.com/karpathy/nanochat). The core idea is still that you are mostly programming the research process through `program.md`, but the default controller is now the explicit `evolve.py` population runner instead of an ad hoc keep-or-reset loop. A bit more context on the original project is here in this [tweet](https://x.com/karpathy/status/2029701092347630069).
 
 ## Open source project worth to look at
 
@@ -14,17 +14,19 @@ Open source collabaration platform for agentic swarms in organizations and commu
 
 ## How it works
 
-The repo is deliberately kept small and only really has a three files that matter:
+The repo is still deliberately small, but the core pieces now have clearer boundaries:
 
-- **`prepare.py`** — fixed constants, one-time data prep (downloads training data, trains a BPE tokenizer), and runtime utilities (dataloader, evaluation). Not modified.
-- **`train.py`** — the single file the agent edits. Contains the full GPT model, optimizer (Muon + AdamW), and training loop. Everything is fair game: architecture, hyperparameters, optimizer, batch size, etc. **This file is edited and iterated on by the agent**.
-- **`program.md`** — baseline instructions for one agent. Point your agent here and let it go. **This file is edited and iterated on by the human**.
+- **`prepare.py`** — fixed constants, one-time data prep, tokenizer training, dataloader, and evaluation. Not modified during search.
+- **`train.py`** — shared execution skeleton for a single candidate run. It supports legacy `uv run train.py` execution and `--experiment <path>` execution for the population runner.
+- **`evolve.py`** — the primary evolutionary controller. It seeds or resumes the population, executes one or more generations, ranks individuals, and persists artifacts.
+- **`evolution/`** — schema normalization, slot registry identity, ranking, artifact writers, and runner logic.
+- **`program.md`** — baseline agent contract for the evolutionary workflow. This is the main file the human iterates on.
 
 By design, training runs for a **fixed 5-minute time budget** (wall clock, excluding startup/compilation), regardless of the details of your compute. The metric is **val_bpb** (validation bits per byte) — lower is better, and vocab-size-independent so architectural changes are fairly compared.
 
 ## Quick start
 
-**Requirements:** Apple Silicon Mac (M1/M2/M3/M4 with Metal/MPS support) or a single NVIDIA GPU, Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Apple Silicon Mac (M1/M2/M3/M4 with Metal/MPS support), Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 
@@ -37,11 +39,14 @@ uv sync
 # 3. Download data and train tokenizer (one-time, ~2 min)
 uv run prepare.py
 
-# 4. Manually run a single training experiment (~5 min)
+# 4. Legacy single-run smoke test (~5 min)
 uv run train.py
+
+# 5. Run one small evolutionary generation (~population_size * 5 min)
+uv run evolve.py --population-size 2 --generation-limit 1
 ```
 
-If the above commands all work ok, your setup is working and you can go into autonomous research mode.
+The legacy `train.py` command is still useful for smoke tests and debugging. The primary controller is now `evolve.py`. Re-running `uv run evolve.py ...` after a completed generation resumes from `population/current_generation.json` and breeds the next generation automatically.
 
 **Platforms support**. This fork officially supports **macOS (Apple Silicon / MPS)** and CPU environments, while preserving the original NVIDIA GPU support. It removes the hardcoded dependency on FlashAttention-3, falling back to PyTorch's native Scaled Dot Product Attention (SDPA) with manual sliding window causal masking when needed. It also features MPS-specific optimizations (disabling unsupported `torch.compile` paths, lowering memory batch sizes for Metal bounds, and precisely casting optimizer states) allowing you to run autonomous research agents directly on your Mac!
 
@@ -50,7 +55,7 @@ If the above commands all work ok, your setup is working and you can go into aut
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
 
 ```
-Hi have a look at program.md and let's kick off a new experiment! let's do the setup first.
+Read program.md, inspect the current population state, and continue the evolutionary run.
 ```
 
 The `program.md` file is essentially a super lightweight "skill".
@@ -58,21 +63,25 @@ The `program.md` file is essentially a super lightweight "skill".
 ## Project structure
 
 ```
-prepare.py      — constants, data prep + runtime utilities (do not modify)
-train.py        — model, optimizer, training loop (agent modifies this)
-program.md      — agent instructions
+prepare.py      — constants, data prep + runtime utilities
+train.py        — shared training skeleton / single-run debug path
+evolve.py       — evolutionary controller entrypoint
+evolution/      — schema, registry, ranking, artifacts, runner
+program.md      — agent instructions for the evolutionary loop
 pyproject.toml  — dependencies
 ```
 
 ## Design choices
 
-- **Single file to modify.** The agent only touches `train.py`. This keeps the scope manageable and diffs reviewable.
+- **Explicit controller state.** `population/current_generation.json`, `results/runs.tsv`, and per-individual artifacts make lineage and replayability explicit.
+- **Stable training skeleton.** `train.py` remains the execution harness for one candidate, while `evolve.py` owns population search and persistence.
 - **Fixed time budget.** Training always runs for exactly 5 minutes, regardless of your specific platform. This means you can expect approx 12 experiments/hour and approx 100 experiments while you sleep. There are two upsides of this design decision. First, this makes experiments directly comparable regardless of what the agent changes (model size, batch size, architecture, etc). Second, this means that autoresearch will find the most optimal model for your platform in that time budget. The downside is that your runs (and results) become not comparable to other people running on other compute platforms.
-- **Self-contained.** No external dependencies beyond PyTorch and a few small packages. No distributed training, no complex configs. One GPU, one file, one metric.
+- **Sequential executor first.** One individual runs at a time on one device. This keeps v1 simple and leaves room for a future parallel backend.
+- **Self-contained.** No external services or orchestration stack. Just PyTorch, a few small packages, and explicit local artifacts.
 
 ## Platform support
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+This fork currently targets **macOS on Apple Silicon / MPS**. Both `prepare.py` and `train.py` enforce that runtime contract. If you want a broader multi-platform version, treat this repository as the macOS-specific evolutionary fork rather than a generic launcher.
 
 If you're going to be using autoresearch on Apple Macbooks in particular, I'd recommend one of the forks below. On top of this, if you'd like half-decent results at such a small scale, I'd recommend this [TinyStories dataset](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean) which is cleaner than what exists out there otherwise. It should be a drop in replacement because I have encoded it in exactly the same format. Any of your favorite coding agents should be able to do the swap :)
 

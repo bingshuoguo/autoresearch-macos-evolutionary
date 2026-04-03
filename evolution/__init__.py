@@ -7,6 +7,12 @@ from .schema import (
     canonical_genome_json,
     normalize_genome,
 )
+from .registry import (
+    REQUIRED_KEYS,
+    SlotManifestEntry,
+    load_active_registry,
+    slot_registry_hash,
+)
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -14,4 +20,8 @@ __all__ = [
     "build_individual_id",
     "canonical_genome_json",
     "normalize_genome",
+    "REQUIRED_KEYS",
+    "SlotManifestEntry",
+    "load_active_registry",
+    "slot_registry_hash",
 ]

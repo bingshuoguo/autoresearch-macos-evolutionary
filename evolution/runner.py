@@ -34,6 +34,15 @@ DEFAULT_GENERATION_LIMIT = 1
 DEFAULT_MAX_SEQ_LEN = 2048
 DEFAULT_TIMEOUT_SECONDS = 600
 DEFAULT_REGISTRY_MANIFEST = Path("library/slots/active_registry.json")
+NUMERIC_BLEND_ALPHA_MIN = 0.25
+NUMERIC_BLEND_ALPHA_MAX = 0.75
+INDIVIDUAL_MUTATION_RATE = 0.15
+INTEGER_NUMERIC_FIELDS = {
+    "depth",
+    "aspect_ratio",
+    "total_batch_size",
+    "device_batch_size",
+}
 
 BASELINE_GENOME_TEMPLATE = {
     "numeric": {
@@ -154,6 +163,15 @@ def write_generation_state(
     return current_path, archive_path
 
 
+def load_current_generation_state(root: Path | str) -> dict[str, Any] | None:
+    """Load the latest persisted generation state, if present."""
+
+    current_path = Path(root) / "population" / "current_generation.json"
+    if not current_path.exists():
+        return None
+    return json.loads(current_path.read_text(encoding="utf-8"))
+
+
 def _core_genome(genome: dict[str, Any]) -> dict[str, Any]:
     return {
         "schema_version": genome.get("schema_version", SCHEMA_VERSION),
@@ -186,6 +204,131 @@ def _annotate_genome(
 
 def _scale_numeric(value: float, factor: float) -> float:
     return round(value * factor, 6)
+
+
+def _quantize_total_batch_size(total_batch_size: int, device_batch_size: int, max_seq_len: int) -> int:
+    step_tokens = max(device_batch_size * max_seq_len, 1)
+    accum_steps = max(1, round(total_batch_size / step_tokens))
+    return accum_steps * step_tokens
+
+
+def _source_genome(record: dict[str, Any]) -> dict[str, Any]:
+    genome = record.get("genome", record)
+    return _core_genome(genome)
+
+
+def _blend_numeric_value(field_name: str, left: Any, right: Any, rng: random.Random) -> Any:
+    alpha = rng.uniform(NUMERIC_BLEND_ALPHA_MIN, NUMERIC_BLEND_ALPHA_MAX)
+    blended = alpha * float(left) + (1.0 - alpha) * float(right)
+    if field_name in INTEGER_NUMERIC_FIELDS:
+        return max(1, int(round(blended)))
+    return round(blended, 6)
+
+
+def _crossover_genomes(
+    left_parent: dict[str, Any],
+    right_parent: dict[str, Any],
+    *,
+    generation: int,
+    rng: random.Random,
+    max_seq_len: int,
+    slot_options: dict[str, list[str]],
+) -> dict[str, Any]:
+    left = _source_genome(left_parent)
+    right = _source_genome(right_parent)
+    child = {
+        "schema_version": SCHEMA_VERSION,
+        "generation": generation,
+        "parents": [
+            left_parent["individual_id"],
+            right_parent["individual_id"],
+        ],
+        "numeric": {},
+        "categorical": {},
+        "slots": {},
+        "metadata": {
+            "created_by": "crossover+mutation",
+            "notes": f"parents={left_parent['individual_id']},{right_parent['individual_id']}",
+        },
+    }
+
+    for field_name in left["numeric"]:
+        child["numeric"][field_name] = _blend_numeric_value(
+            field_name,
+            left["numeric"][field_name],
+            right["numeric"][field_name],
+            rng,
+        )
+
+    for field_name in left["categorical"]:
+        child["categorical"][field_name] = rng.choice(
+            [left["categorical"][field_name], right["categorical"][field_name]]
+        )
+
+    for slot_name in left["slots"]:
+        inherited = rng.choice([left["slots"][slot_name], right["slots"][slot_name]])
+        child["slots"][slot_name] = inherited
+        if slot_name in slot_options and inherited not in slot_options[slot_name]:
+            child["slots"][slot_name] = slot_options[slot_name][0]
+
+    child["numeric"]["depth"] = max(1, int(child["numeric"]["depth"]))
+    child["numeric"]["aspect_ratio"] = max(1, int(child["numeric"]["aspect_ratio"]))
+    child["numeric"]["device_batch_size"] = max(1, int(child["numeric"]["device_batch_size"]))
+    child["numeric"]["total_batch_size"] = _quantize_total_batch_size(
+        int(child["numeric"]["total_batch_size"]),
+        int(child["numeric"]["device_batch_size"]),
+        max_seq_len,
+    )
+    return child
+
+
+def _mutate_child_genome(
+    genome: dict[str, Any],
+    *,
+    rng: random.Random,
+    max_seq_len: int,
+    slot_options: dict[str, list[str]],
+) -> dict[str, Any]:
+    child = _core_genome(genome)
+    if rng.random() >= INDIVIDUAL_MUTATION_RATE:
+        return child
+
+    mutation_kind = rng.choice(["numeric", "categorical", "slot"])
+    if mutation_kind == "numeric":
+        field_name = rng.choice(list(child["numeric"]))
+        if field_name == "depth":
+            child["numeric"][field_name] = max(1, int(child["numeric"][field_name]) + rng.choice([-1, 1]))
+        elif field_name == "aspect_ratio":
+            child["numeric"][field_name] = max(1, int(child["numeric"][field_name]) + rng.choice([-16, 16]))
+        elif field_name == "device_batch_size":
+            child["numeric"][field_name] = max(1, int(child["numeric"][field_name]) + rng.choice([-8, 8]))
+        elif field_name == "total_batch_size":
+            child["numeric"][field_name] = _quantize_total_batch_size(
+                int(child["numeric"][field_name]) * rng.choice([1, 2]),
+                int(child["numeric"]["device_batch_size"]),
+                max_seq_len,
+            )
+        else:
+            child["numeric"][field_name] = _scale_numeric(
+                float(child["numeric"][field_name]),
+                rng.choice([0.8, 1.2]),
+            )
+    elif mutation_kind == "categorical":
+        field_name = rng.choice(list(child["categorical"]))
+        if field_name == "window_pattern":
+            child["categorical"][field_name] = rng.choice(["L", "S", "SL", "LS"])
+    else:
+        slot_name = rng.choice(list(child["slots"]))
+        options = slot_options.get(slot_name, [child["slots"][slot_name]])
+        if options:
+            child["slots"][slot_name] = rng.choice(options)
+
+    child["numeric"]["total_batch_size"] = _quantize_total_batch_size(
+        int(child["numeric"]["total_batch_size"]),
+        int(child["numeric"]["device_batch_size"]),
+        max_seq_len,
+    )
+    return child
 
 
 def _mutate_seed_genome(
@@ -269,6 +412,95 @@ def create_initial_population(
         ordinal += 1
 
     return population
+
+
+def breed_next_generation(
+    ranked_population: list[dict[str, Any]],
+    *,
+    generation: int,
+    population_size: int,
+    elite_count: int,
+    tournament_size: int,
+    rng_seed: int,
+    max_seq_len: int,
+    registry_entries: list[SlotManifestEntry] | None = None,
+) -> list[dict[str, Any]]:
+    """Breed the next generation from a ranked prior population."""
+
+    if not ranked_population:
+        raise ValueError("ranked_population must not be empty")
+    if elite_count < 0 or elite_count > population_size:
+        raise ValueError("elite_count must satisfy 0 <= elite_count <= population_size")
+
+    rng = random.Random(rng_seed)
+    slot_options: dict[str, list[str]] = {}
+    if registry_entries:
+        for entry in registry_entries:
+            slot_options.setdefault(entry.slot_type, []).append(entry.slot_id)
+
+    next_population: list[dict[str, Any]] = []
+    for ordinal, elite in enumerate(ranked_population[:elite_count], start=1):
+        elite_genome = _source_genome(elite)
+        elite_genome["generation"] = generation
+        elite_genome["parents"] = [elite["individual_id"]]
+        elite_genome["metadata"] = {
+            "created_by": "elitism",
+            "notes": f"elite copy of {elite['individual_id']}",
+        }
+        next_population.append(
+            _annotate_genome(
+                elite_genome,
+                generation=generation,
+                ordinal=ordinal,
+                max_seq_len=max_seq_len,
+            )
+        )
+
+    ordinal = elite_count + 1
+    while len(next_population) < population_size:
+        left_parent = tournament_select(
+            ranked_population,
+            tournament_size=min(tournament_size, len(ranked_population)),
+            rng_seed=rng.randint(0, 1_000_000_000),
+        )
+        right_parent = tournament_select(
+            ranked_population,
+            tournament_size=min(tournament_size, len(ranked_population)),
+            rng_seed=rng.randint(0, 1_000_000_000),
+        )
+        if len(ranked_population) > 1 and right_parent["individual_id"] == left_parent["individual_id"]:
+            alternatives = [
+                candidate
+                for candidate in ranked_population
+                if candidate["individual_id"] != left_parent["individual_id"]
+            ]
+            right_parent = rng.choice(alternatives)
+
+        child = _crossover_genomes(
+            left_parent,
+            right_parent,
+            generation=generation,
+            rng=rng,
+            max_seq_len=max_seq_len,
+            slot_options=slot_options,
+        )
+        child = _mutate_child_genome(
+            child,
+            rng=rng,
+            max_seq_len=max_seq_len,
+            slot_options=slot_options,
+        )
+        next_population.append(
+            _annotate_genome(
+                child,
+                generation=generation,
+                ordinal=ordinal,
+                max_seq_len=max_seq_len,
+            )
+        )
+        ordinal += 1
+
+    return next_population
 
 
 def parse_training_summary(log_output: str) -> dict[str, Any]:

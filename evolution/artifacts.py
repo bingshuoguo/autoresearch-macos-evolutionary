@@ -77,6 +77,22 @@ def write_registry_manifest_artifact(
     return _write_json(artifact_dir / "registry_manifest.json", list(manifest))
 
 
+def write_run_log_artifact(root: Path | str, individual_id: str, log_output: str) -> Path:
+    """Persist the raw run log for one individual."""
+
+    artifact_dir = ensure_artifact_dir(root, individual_id)
+    path = artifact_dir / "run.log"
+    path.write_text(log_output, encoding="utf-8")
+    return path
+
+
+def write_summary_artifact(root: Path | str, individual_id: str, summary: Mapping[str, Any]) -> Path:
+    """Persist the parsed execution summary for one individual."""
+
+    artifact_dir = ensure_artifact_dir(root, individual_id)
+    return _write_json(artifact_dir / "summary.json", dict(summary))
+
+
 def _format_scalar(value: Any) -> str:
     if value is None:
         return "null"

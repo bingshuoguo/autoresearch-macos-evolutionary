@@ -20,6 +20,15 @@ from .ranking import (
     rank_population,
     validate_run_record,
 )
+from .runner import (
+    DEFAULT_ELITE_COUNT,
+    DEFAULT_GENERATION_LIMIT,
+    DEFAULT_POPULATION_SIZE,
+    DEFAULT_TOURNAMENT_SIZE,
+    parse_args,
+    tournament_select,
+    write_generation_state,
+)
 from .artifacts import (
     RUN_RECORD_FIELDS,
     append_run_record,
@@ -43,6 +52,13 @@ __all__ = [
     "compute_complexity_score",
     "rank_population",
     "validate_run_record",
+    "DEFAULT_ELITE_COUNT",
+    "DEFAULT_GENERATION_LIMIT",
+    "DEFAULT_POPULATION_SIZE",
+    "DEFAULT_TOURNAMENT_SIZE",
+    "parse_args",
+    "tournament_select",
+    "write_generation_state",
     "RUN_RECORD_FIELDS",
     "append_run_record",
     "ensure_artifact_dir",

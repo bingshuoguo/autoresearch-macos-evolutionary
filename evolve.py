@@ -1,4 +1,4 @@
-"""CLI entrypoint for the initial evolutionary runner."""
+"""CLI entrypoint for the genetic search runner."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from evolution.runner import (
 
 
 def assert_clean_worktree() -> None:
-    """Refuse evolutionary runs on a dirty worktree by default."""
+    """Refuse genetic-search runs on a dirty worktree by default."""
 
     result = subprocess.run(
         ["git", "status", "--short"],

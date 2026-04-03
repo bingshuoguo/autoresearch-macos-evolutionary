@@ -11,14 +11,14 @@ To set up or resume an experiment, work with the user to:
    - `README.md` — repository context.
    - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
    - `train.py` — shared execution skeleton for one candidate run.
-   - `evolve.py` — primary evolutionary controller.
+   - `evolve.py` — primary genetic controller.
    - `evolution/` — schema, registry, ranking, artifacts, and runner logic.
 3. **Verify data exists**: check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
 4. **Verify the worktree is clean before launch**: `uv run evolve.py` refuses to run on a dirty worktree. If you intentionally change controller or model code, commit those changes before launching the next generation.
 5. **Confirm resume state**:
    - if `population/current_generation.json` does not exist, the first controller run seeds generation 0 automatically
    - if it exists, the controller resumes from it and breeds the next generation automatically
-6. **Confirm and go**: once setup looks good, start or continue the evolutionary loop.
+6. **Confirm and go**: once setup looks good, start or continue the genetic loop.
 
 ## Experimentation
 
@@ -36,7 +36,7 @@ population_size * 5 minutes + startup/eval overhead
 
 **Primary workflow**
 
-- `uv run evolve.py` is the main research loop
+- `uv run evolve.py` is the main genetic search loop
 - `uv run train.py` is legacy compatibility mode for single-run debugging
 - `uv run train.py --experiment artifacts/<individual_id>/experiment.json` is the precise rerun path for one saved individual
 
@@ -108,4 +108,4 @@ LOOP FOREVER:
 
 **NEVER STOP**
 
-Once the evolutionary loop has begun, do not pause to ask the human whether to continue. Keep running generations, inspecting artifacts, and improving the search process until interrupted.
+Once the genetic loop has begun, do not pause to ask the human whether to continue. Keep running generations, inspecting artifacts, and improving the search process until interrupted.

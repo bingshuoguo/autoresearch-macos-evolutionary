@@ -1,4 +1,4 @@
-"""Sequential evolutionary runner primitives."""
+"""Sequential genetic-search runner primitives."""
 
 from __future__ import annotations
 
@@ -76,9 +76,9 @@ BASELINE_GENOME_TEMPLATE = {
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse CLI arguments for the initial evolutionary runner."""
+    """Parse CLI arguments for the initial genetic runner."""
 
-    parser = argparse.ArgumentParser(description="Autoresearch evolutionary runner")
+    parser = argparse.ArgumentParser(description="Autoresearch genetic runner")
     parser.add_argument("--population-size", type=int, default=DEFAULT_POPULATION_SIZE)
     parser.add_argument("--elite-count", type=int, default=DEFAULT_ELITE_COUNT)
     parser.add_argument("--tournament-size", type=int, default=DEFAULT_TOURNAMENT_SIZE)
